@@ -15,7 +15,7 @@ import { DeniedError } from "./rate-limiter.js";
 import { dispatchTrolleyTool, isTrolleyTool } from "./trolley-tools.js";
 import { dispatchOrderTool, isOrderTool } from "./order-tools.js";
 import { dispatchAccountTool, isAccountTool } from "./account-tools.js";
-import { dispatchSlotTool, isSlotTool } from "./slot-tools.js";
+import { dispatchSlotTool, isSlotTool, SLOT_TYPE_VALUES } from "./slot-tools.js";
 
 const VERSION = "0.1.0";
 const SERVER_NAME = "waitrose-mcp";
@@ -26,21 +26,22 @@ const PORT = parseInt(process.env.PORT ?? "8080", 10);
 // issues a fresh HTTP request; there is no per-session client state.
 const client = new WaitroseClient();
 
-// Auth extension point.
+// Auth.
 // If credentials are provided, log in at startup; otherwise remain
 // anonymous (the upstream client falls back to customerId "-1" for
-// anonymous product search and browse). Authenticated tools (trolley
-// management etc) are not implemented yet — when they are, they should
-// check client.isAuthenticated() and return a clear "not authenticated"
-// error when it is false.
-const username = process.env.WAITROSE_USERNAME;
+// anonymous product search and browse). Authenticated tools (trolley,
+// orders, slots, account) check client.isAuthenticated() and return a
+// clear "not authenticated" error when it is false.
+// WAITROSE_EMAIL is accepted as an alias for WAITROSE_USERNAME.
+const username = process.env.WAITROSE_USERNAME || process.env.WAITROSE_EMAIL;
 const password = process.env.WAITROSE_PASSWORD;
 
 if (username && password) {
   try {
     await client.login(username, password);
     sessionAuthenticated.set(1);
-    console.error(`[INIT] Authenticated as ${username}`);
+    // Don't log the username/email — it's PII and ends up in container logs.
+    console.error("[INIT] Authenticated with Waitrose");
   } catch (err) {
     console.error("[INIT] Login failed:", err);
     process.exit(1);
@@ -229,19 +230,23 @@ function createMcpServer(): Server {
       {
         name: "get_trolley",
         description:
-          "Get the current trolley (basket) — items, totals, and whether the £40 minimum-spend threshold is met. Requires authentication.",
+          "Get the current trolley (basket). `summary.items` lists each line with product name, size, quantity, unit and line prices; `summary` also carries the estimated total, delivery charge, savings, and whether the minimum-spend threshold is met. The raw upstream response follows. Requires authentication.",
         inputSchema: { type: "object", properties: {} },
       },
       {
         name: "add_to_trolley",
         description:
-          "Add a single product (by Waitrose line number) to the active trolley. Returns the updated trolley state. Requires authentication. Refused if quantity meets WAITROSE_MAX_QTY_PER_LINE, or if pre-state basket totals meet the configured caps.",
+          "Add a single product (by Waitrose line number or product id) to the active trolley, setting that line's quantity. Returns the updated trolley state. Requires authentication. Refused if quantity meets WAITROSE_MAX_QTY_PER_LINE, or if pre-state basket totals meet the configured caps.",
         inputSchema: {
           type: "object",
           properties: {
             lineNumber: {
               type: "string",
-              description: "Waitrose product line number",
+              description: "Waitrose product line number (e.g. '088411'). Either lineNumber or productId is required.",
+            },
+            productId: {
+              type: "string",
+              description: "Product id from search results (e.g. '088411-45361-45362'); its first segment is the line number",
             },
             quantity: {
               type: "number",
@@ -253,22 +258,24 @@ function createMcpServer(): Server {
               description: "Unit of measure: C62 (each, default), KGM (kilograms), GRM (grams)",
             },
           },
-          required: ["lineNumber"],
         },
       },
       {
         name: "remove_from_trolley",
         description:
-          "Remove a single line from the active trolley. Returns the updated trolley state. Requires authentication.",
+          "Remove a single line from the active trolley (works for weighed KGM lines too). Returns the updated trolley state. Requires authentication.",
         inputSchema: {
           type: "object",
           properties: {
             lineNumber: {
               type: "string",
-              description: "Waitrose product line number to remove",
+              description: "Waitrose product line number to remove. Either lineNumber or productId is required.",
+            },
+            productId: {
+              type: "string",
+              description: "Product id (e.g. '088411-45361-45362') as an alternative to lineNumber",
             },
           },
-          required: ["lineNumber"],
         },
       },
       {
@@ -416,7 +423,7 @@ function createMcpServer(): Server {
       {
         name: "get_current_slot",
         description:
-          "Get the currently booked delivery or collection slot. Returns null if no slot is booked. Requires authentication.",
+          "Get the delivery or collection slot currently reserved for the trolley (type, branch/address, start/end, expiry, order cut-off, charge, slotReservationId). Returns null if no slot is reserved. Requires authentication.",
         inputSchema: {
           type: "object",
           properties: {
@@ -428,24 +435,86 @@ function createMcpServer(): Server {
         },
       },
       {
-        name: "list_slot_dates",
+        name: "list_delivery_addresses",
         description:
-          "List available dates with delivery or collection slots. Returns date IDs and day-of-week labels. Use list_slot_days to get the actual time windows for a date. Requires authentication.",
+          "List the account's saved addresses. Use an address id as addressId for delivery slot tools. Requires authentication.",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
+        name: "find_branches",
+        description:
+          "Find Waitrose branches for a postcode or town. fulfilmentType COLLECTION (default) lists nearby Click & Collect branches with distance — pass a branch id as branchId to the slot tools; DELIVERY returns the branch that delivers to that postcode. Requires authentication.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            postcode: {
+              type: "string",
+              description: "UK postcode or town, e.g. 'SW1A 1AA'",
+            },
+            fulfilmentType: {
+              type: "string",
+              enum: ["COLLECTION", "DELIVERY"],
+              description: "Default: COLLECTION",
+            },
+          },
+          required: ["postcode"],
+        },
+      },
+      {
+        name: "list_slots",
+        description:
+          "List delivery or Click & Collect slots over a date range — date, start/end time, status, charge and slotId for each. Delivery uses addressId (defaults to the account's address); collection uses branchId (defaults to the account's default branch; see find_branches). Pass a slotId (with the returned addressId/branchId) to book_slot. Requires authentication.",
         inputSchema: {
           type: "object",
           properties: {
             slotType: {
               type: "string",
-              enum: ["DELIVERY", "COLLECTION"],
-              description: "Whether to list delivery or collection slots",
+              enum: SLOT_TYPE_VALUES,
+              description: "DELIVERY, or GROCERY_COLLECTION for Click & Collect (COLLECTION is accepted as an alias). ENTERTAINING_COLLECTION is the separate entertaining service.",
             },
-            branchId: {
+            fromDate: {
               type: "string",
-              description: "Branch ID (optional; defaults to the account's default branch)",
+              description: "First date, YYYY-MM-DD (default: today, UK time)",
+            },
+            days: {
+              type: "number",
+              description: "Number of days to return (default: 3, max: 14)",
             },
             addressId: {
               type: "string",
-              description: "Delivery address ID (optional; for delivery slots)",
+              description: "Delivery address id from list_delivery_addresses (delivery only)",
+            },
+            branchId: {
+              type: "string",
+              description: "Branch id from find_branches (collection only)",
+            },
+            availableOnly: {
+              type: "boolean",
+              description: "Only include AVAILABLE slots (default: true)",
+            },
+          },
+          required: ["slotType"],
+        },
+      },
+      {
+        name: "list_slot_dates",
+        description:
+          "List dates that have delivery or collection slots. Returns date IDs and day-of-week labels. Use list_slots (or list_slot_days) for the actual time windows. Requires authentication.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            slotType: {
+              type: "string",
+              enum: SLOT_TYPE_VALUES,
+              description: "DELIVERY or GROCERY_COLLECTION (COLLECTION is an alias)",
+            },
+            branchId: {
+              type: "string",
+              description: "Branch ID (collection; defaults to the account's default branch)",
+            },
+            addressId: {
+              type: "string",
+              description: "Delivery address ID (delivery; defaults to the account's address)",
             },
           },
           required: ["slotType"],
@@ -454,26 +523,30 @@ function createMcpServer(): Server {
       {
         name: "list_slot_days",
         description:
-          "List available time windows for a given date. Returns slot IDs, start/end times, status, and charge. Pass a slot ID from this response to book_slot. Requires authentication.",
+          "Raw slot grid from a given date — slot IDs, start/end times, status, and charge per day. list_slots returns the same data in a flatter shape. Requires authentication.",
         inputSchema: {
           type: "object",
           properties: {
             slotType: {
               type: "string",
-              enum: ["DELIVERY", "COLLECTION"],
-              description: "Whether to list delivery or collection slots",
+              enum: SLOT_TYPE_VALUES,
+              description: "DELIVERY or GROCERY_COLLECTION (COLLECTION is an alias)",
             },
             fromDate: {
               type: "string",
-              description: "Date to fetch slots from, ISO 8601 format (e.g. 2026-05-14)",
+              description: "Date to fetch slots from, YYYY-MM-DD (e.g. 2026-05-14)",
+            },
+            days: {
+              type: "number",
+              description: "Number of days (default: 1, max: 14)",
             },
             branchId: {
               type: "string",
-              description: "Branch ID (optional; defaults to the account's default branch)",
+              description: "Branch ID (collection; defaults to the account's default branch)",
             },
             addressId: {
               type: "string",
-              description: "Delivery address ID (optional; for delivery slots)",
+              description: "Delivery address ID (delivery; defaults to the account's address)",
             },
           },
           required: ["slotType", "fromDate"],
@@ -482,22 +555,30 @@ function createMcpServer(): Server {
       {
         name: "book_slot",
         description:
-          "Reserve a Waitrose delivery or collection window. **Commits Douglas to a slot.** Use only when the user has confirmed the specific slot. Slots are scarce; do not call speculatively. Requires authentication.",
+          "Reserve a delivery or collection slot for the trolley. Use only when the user has confirmed the specific slot — slots are scarce; do not call speculatively. The reservation is held until checkout or expiry and can be released with cancel_slot. Refuses to replace an already-reserved slot unless replaceExisting is true. Does not check out or place an order. Requires authentication.",
         inputSchema: {
           type: "object",
           properties: {
             slotId: {
               type: "string",
-              description: "Slot ID from list_slot_days",
+              description: "Slot ID from list_slots / list_slot_days, e.g. '2026-10-12_08:00_09:00'",
             },
             slotType: {
               type: "string",
-              enum: ["DELIVERY", "COLLECTION"],
-              description: "Must match the slot type of the chosen slot",
+              enum: SLOT_TYPE_VALUES,
+              description: "Must match the slot type the slot was listed with",
             },
             addressId: {
               type: "string",
-              description: "Delivery address ID (optional; for delivery slots)",
+              description: "Delivery address ID (required for DELIVERY — use the addressId returned by list_slots)",
+            },
+            branchId: {
+              type: "string",
+              description: "Branch ID for collection (defaults to the account's default branch)",
+            },
+            replaceExisting: {
+              type: "boolean",
+              description: "Allow replacing a slot that is already reserved (default: false)",
             },
             confirm: {
               type: "boolean",
@@ -505,6 +586,25 @@ function createMcpServer(): Server {
             },
           },
           required: ["slotId", "slotType", "confirm"],
+        },
+      },
+      {
+        name: "cancel_slot",
+        description:
+          "Release the slot currently reserved for the trolley (the website's 'Cancel slot'). Does not affect placed orders. Requires authentication.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            slotReservationId: {
+              type: "string",
+              description: "Reservation to cancel (optional; defaults to the current slot's slotReservationId)",
+            },
+            confirm: {
+              type: "boolean",
+              description: "Must be true — explicit acknowledgement that this releases the slot",
+            },
+          },
+          required: ["confirm"],
         },
       },
     ],

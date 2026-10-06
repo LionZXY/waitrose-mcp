@@ -47,6 +47,30 @@ describe("redactArgs", () => {
     expect(result.count).toBe("<redacted>");
   });
 
+  describe("slot tools", () => {
+    it("redacts the postcode (PII) for find_branches", () => {
+      const result = redactArgs("find_branches", { postcode: "SW1A 1AA", fulfilmentType: "COLLECTION" });
+      expect(result.postcode).toBe("<redacted>");
+      expect(result.fulfilmentType).toBe("COLLECTION");
+    });
+
+    it("passes through slot identifiers for book_slot and cancel_slot", () => {
+      expect(
+        redactArgs("book_slot", { slotId: "2026-10-12_08:00_09:00", slotType: "DELIVERY", addressId: "a1", confirm: true }),
+      ).toEqual({ slotId: "2026-10-12_08:00_09:00", slotType: "DELIVERY", addressId: "a1", confirm: true });
+      expect(redactArgs("cancel_slot", { slotReservationId: "r1", confirm: true })).toEqual({
+        slotReservationId: "r1",
+        confirm: true,
+      });
+    });
+
+    it("passes through list_slots parameters", () => {
+      expect(
+        redactArgs("list_slots", { slotType: "DELIVERY", fromDate: "2026-10-12", days: 3, availableOnly: true }),
+      ).toEqual({ slotType: "DELIVERY", fromDate: "2026-10-12", days: 3, availableOnly: true });
+    });
+  });
+
   describe("trolley tools", () => {
     it("passes through allowlisted fields for add_to_trolley", () => {
       const result = redactArgs("add_to_trolley", {

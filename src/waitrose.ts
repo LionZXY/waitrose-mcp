@@ -17,7 +17,10 @@ import { TokenBucket, rateLimiterFromEnv } from "./rate-limiter.js";
 const GRAPHQL_URL = "https://www.waitrose.com/api/graphql-prod/graph/live";
 const SEARCH_API_URL = "https://www.waitrose.com/api/content-prod/v2/cms/publish/productcontent";
 const PRODUCTS_API_URL = "https://www.waitrose.com/api/products-prod/v1/products";
+const BRANCH_API_URL = "https://www.waitrose.com/api/branch-prod/v4/branches";
 const CLIENT_ID = "ANDROID_APP";
+/** Re-login this long before the access token's advertised expiry. */
+const TOKEN_EXPIRY_SKEW_MS = 60_000;
 
 // LOCAL PATCH (not upstream): the REST API rejects requests with no Authorization
 // header (HTTP 401). Real anonymous traffic from waitrose.com carries
@@ -74,13 +77,18 @@ const QUERIES = {
   CancelAmendOrder: `mutation CancelAmendOrder($input: ID!) { cancelAmendOrder(customerOrderId: $input) { failures { __typename ...OrderFailure } } }  fragment OrderFailure on OrderFailure { type message }`,
   
   // Slots
-  CurrentSlot: `query CurrentSlot($input: CurrentSlotInput) { currentSlot(currentSlotInput: $input) { slotType branchId addressId postcode startDateTime endDateTime expiryDateTime orderCutoffDateTime amendOrderCutoffDateTime shopByDateTime deliveryCharge { amount currencyCode } slotGridType } }`,
+  CurrentSlot: `query CurrentSlot($input: CurrentSlotInput) { currentSlot(currentSlotInput: $input) { slotType branchId addressId postcode startDateTime endDateTime expiryDateTime orderCutoffDateTime amendOrderCutoffDateTime shopByDateTime slotReservationId slotGridType greenSlot deliveryCharge { amount currencyCode } } }`,
   
   SlotDates: `query SlotDates($slotDatesInput: SlotDatesInput) { slotDates(slotDatesInput: $slotDatesInput) { content { id dayOfWeek } failures { message type } } }`,
   
   SlotDays: `query SlotDays($slotDaysInput: SlotDaysInput) { slotDays(slotDaysInput: $slotDaysInput) { content { id branchId slotType date slots { id startDateTime endDateTime shopByDateTime status slotGridType charge { currencyCode amount } greenSlot deliveryPassSlot } } failures { message type } variant } }`,
   
   BookSlot: `mutation BookSlot($input: BookSlotInput) { bookSlot(bookSlotInput: $input) { slotExpiryDateTime orderCutoffDateTime amendOrderCutoffDateTime shopByDateTime failures { type message } variant } }`,
+
+  CancelSlot: `mutation CancelSlot($slotReservationId: ID!) { cancelSlot(slotReservationId: $slotReservationId) { failures { type message } } }`,
+
+  // Addresses (the customer's saved delivery addresses)
+  GetAddresses: `query GetAddresses { addresses { id line1 line2 line3 town region country postalCode } }`,
   
   // Campaigns
   GetCampaigns: `query GetCampaigns { campaigns { id name marketingStartDate marketingEndDate startDate endDate } }`,
@@ -106,8 +114,24 @@ export interface ApiFailure {
   message: string;
 }
 
-/** Slot type options */
-export type SlotType = "DELIVERY" | "COLLECTION";
+/**
+ * Slot type as understood by the Waitrose slot API. Click & Collect for
+ * groceries is `GROCERY_COLLECTION` (the API rejects a bare `COLLECTION`
+ * with "Invalid slot type"); `ENTERTAINING_COLLECTION` is the separate
+ * entertaining/party-food collection service.
+ */
+export type SlotType = "DELIVERY" | "GROCERY_COLLECTION" | "ENTERTAINING_COLLECTION";
+
+/** Accepted by the tool layer; `COLLECTION` is an alias for `GROCERY_COLLECTION`. */
+export type SlotTypeInput = SlotType | "COLLECTION";
+
+export function normaliseSlotType(slotType: SlotTypeInput): SlotType {
+  return slotType === "COLLECTION" ? "GROCERY_COLLECTION" : slotType;
+}
+
+export function isCollectionSlotType(slotType: SlotType): boolean {
+  return slotType !== "DELIVERY";
+}
 
 /** Standard unit of measure (C62 = "each") */
 export type UnitOfMeasure = "C62" | "KGM" | "GRM";
@@ -162,6 +186,8 @@ export interface TrolleyProduct {
   size: string;
   thumbnail: string;
   productType: string;
+  displayPriceQualifier?: string | null;
+  currentSaleUnitPrice?: { price: Price; quantity: Quantity } | null;
 }
 
 export interface TrolleyItem {
@@ -217,12 +243,16 @@ export interface Order {
 }
 
 export interface Slot {
+  /** e.g. "2026-10-12_08:00_09:00" — date plus local start/end time */
   id: string;
   startDateTime: string;
   endDateTime: string;
-  shopByDateTime: string;
+  shopByDateTime: string | null;
+  /** e.g. AVAILABLE, FULLY_BOOKED, UNAVAILABLE */
   status: string;
-  charge: Price;
+  slotGridType?: string | null;
+  /** Null for collection slots (free) */
+  charge: Price | null;
   greenSlot: boolean;
   deliveryPassSlot: boolean;
 }
@@ -248,6 +278,55 @@ export interface AccountProfile {
   };
 }
 
+export interface Address {
+  id: string;
+  line1: string | null;
+  line2: string | null;
+  line3: string | null;
+  town: string | null;
+  region: string | null;
+  country: string | null;
+  postalCode: string | null;
+}
+
+/** Fulfilment type accepted by the branch finder. */
+export type FulfilmentType = "DELIVERY" | "COLLECTION";
+
+export interface Branch {
+  id: string;
+  name: string;
+  type: string;
+  defaultBranch: boolean;
+  /** Miles from the searched location (absent for delivery lookups) */
+  distance?: number;
+  carParkCollectionEnabled?: boolean;
+  services: string[];
+  address: {
+    address1?: string;
+    address2?: string;
+    city?: string;
+    county?: string;
+    postcode?: string;
+  };
+  phone?: string;
+}
+
+/** Input for bookSlot — mirrors the GraphQL BookSlotInput type. */
+export interface BookSlotParams {
+  slotType: SlotType;
+  startDateTime: string;
+  endDateTime: string;
+  /** Required for DELIVERY */
+  addressId?: string;
+  /** Required for collection slot types */
+  branchId?: string;
+  postcode?: string;
+  /** The charge shown in the slot grid; Waitrose rejects the booking if it no longer matches. */
+  expectedSlotCharge?: Price | null;
+  slotGridType?: string | null;
+  greenSlot?: boolean;
+}
+
 export interface Membership {
   number: string;
   type: string;
@@ -262,6 +341,9 @@ export interface TrolleyItemInput {
 
 export interface CurrentSlot {
   slotType: string | null;
+  /** Needed to cancel/release the reservation (cancel_slot). */
+  slotReservationId?: string | null;
+  greenSlot?: boolean | null;
   branchId: string | null;
   addressId: string | null;
   postcode: string | null;
@@ -501,6 +583,8 @@ export class WaitroseClient {
   private customerId: string | null = null;
   private customerOrderId: string | null = null;
   private defaultBranchId: string | null = null;
+  /** Epoch ms at which the current access token expires (null when unknown/anonymous). */
+  private tokenExpiresAt: number | null = null;
   private readonly rateLimiter: TokenBucket;
   private _storedUsername: string | null = null;
   private _storedPassword: string | null = null;
@@ -526,6 +610,23 @@ export class WaitroseClient {
       reauthsTotal.inc({ outcome: "error" });
       auditLog({ audit: true, ts, session: "client", tool: "_reauth", args: {}, outcome: "error", duration_ms: Date.now() - start, error: err instanceof Error ? err.message : String(err) });
       throw err;
+    }
+  }
+
+  /**
+   * Waitrose access tokens live for ~15 minutes (`expiresIn` ≈ 900s) and there
+   * is no refresh-token grant on this API, so re-login shortly before expiry.
+   * Doing this proactively (rather than only on 401) avoids a failed mutation
+   * mid-way through a multi-step trolley/slot operation.
+   */
+  private async ensureFreshToken(): Promise<void> {
+    if (
+      this.tokenExpiresAt !== null &&
+      this._storedUsername &&
+      this._storedPassword &&
+      Date.now() >= this.tokenExpiresAt - TOKEN_EXPIRY_SKEW_MS
+    ) {
+      await this._handleReauth(new Date().toISOString());
     }
   }
 
@@ -566,6 +667,7 @@ export class WaitroseClient {
 
   private async graphql<T>(query: string, variables: Record<string, unknown> = {}): Promise<T> {
     await this.rateLimiter.acquire();
+    await this.ensureFreshToken();
     try {
       return await this.graphqlOnce<T>(query, variables);
     } catch (err) {
@@ -639,6 +741,7 @@ export class WaitroseClient {
     body: Record<string, unknown>
   ): Promise<SearchResponse> {
     await this.rateLimiter.acquire();
+    await this.ensureFreshToken();
     try {
       return await this.restApiOnce(endpoint, body);
     } catch (err) {
@@ -678,6 +781,10 @@ export class WaitroseClient {
     this.customerId = session.customerId;
     this.customerOrderId = session.customerOrderId;
     this.defaultBranchId = session.defaultBranchId;
+    this.tokenExpiresAt =
+      typeof session.expiresIn === "number" && session.expiresIn > 0
+        ? Date.now() + session.expiresIn * 1000
+        : null;
     this._storedUsername = username;
     this._storedPassword = password;
 
@@ -705,6 +812,7 @@ export class WaitroseClient {
     this.refreshToken = null;
     this.customerId = null;
     this.customerOrderId = null;
+    this.tokenExpiresAt = null;
     this._storedUsername = null;
     this._storedPassword = null;
   }
@@ -717,6 +825,11 @@ export class WaitroseClient {
   /** Get the current customer ID */
   getCustomerId(): string | null {
     return this.customerId;
+  }
+
+  /** Get the default (collection) branch ID from the session */
+  getDefaultBranchId(): string | null {
+    return this.defaultBranchId;
   }
 
   // ==========================================================================
@@ -746,6 +859,12 @@ export class WaitroseClient {
       profile: result.data.getAccountProfile,
       memberships: result.data.getMemberships?.memberships || null,
     };
+  }
+
+  /** List the customer's saved addresses (usable as delivery addressId). */
+  async getAddresses(): Promise<Address[]> {
+    const result = await this.graphql<{ data: { addresses: Address[] | null } }>(QUERIES.GetAddresses);
+    return result.data.addresses ?? [];
   }
 
   // ==========================================================================
@@ -783,9 +902,12 @@ export class WaitroseClient {
     return this.updateTrolleyItems([{ lineNumber, quantity: { amount: quantity, uom } }]);
   }
 
-  /** Remove an item from the trolley */
-  async removeFromTrolley(lineNumber: string): Promise<TrolleyResponse> {
-    return this.updateTrolleyItems([{ lineNumber, quantity: { amount: 0, uom: "C62" } }]);
+  /**
+   * Remove an item from the trolley. Weighed lines (KGM/GRM) must be zeroed
+   * with their own unit of measure, so pass `uom` when known.
+   */
+  async removeFromTrolley(lineNumber: string, uom: UnitOfMeasure = "C62"): Promise<TrolleyResponse> {
+    return this.updateTrolleyItems([{ lineNumber, quantity: { amount: 0, uom } }]);
   }
 
   /** Empty the entire trolley */
@@ -932,30 +1054,47 @@ export class WaitroseClient {
   // Slots
   // ==========================================================================
 
-  /** Get the currently booked slot */
+  /**
+   * Get the slot currently reserved against the active trolley/order, or null.
+   * `customerOrderId` is mandatory in CurrentSlotInput.
+   */
   async getCurrentSlot(postcode?: string): Promise<CurrentSlot | null> {
     const result = await this.graphql<{ data: { currentSlot: CurrentSlot | null } }>(
       QUERIES.CurrentSlot,
-      { input: { postcode, customerOrderId: this.customerOrderId } }
+      { input: { postcode, customerOrderId: this.customerOrderId, customerId: this.customerId ?? undefined } }
     );
-    return result.data.currentSlot;
+    const slot = result.data.currentSlot;
+    // The API returns an object full of nulls rather than null when nothing is booked.
+    if (!slot || (!slot.slotType && !slot.startDateTime)) return null;
+    return slot;
   }
 
-  /** Get available slot dates */
+  /**
+   * Build the location part of a slot query. Delivery needs an addressId (the
+   * API resolves the delivering branch from it); collection needs a branchId
+   * and falls back to the session's default branch.
+   */
+  private slotLocation(slotType: SlotType, branchId?: string, addressId?: string): Record<string, string | undefined> {
+    if (isCollectionSlotType(slotType)) {
+      return { branchId: branchId || this.defaultBranchId || undefined };
+    }
+    return { addressId, branchId };
+  }
+
+  /** Get dates that have slots for the given service */
   async getSlotDates(slotType: SlotType, branchId?: string, addressId?: string): Promise<SlotDate[]> {
     const result = await this.graphql<{ 
       data: { 
         slotDates: { 
-          content: SlotDate[];
+          content: SlotDate[] | null;
           failures: ApiFailure[] | null;
         } 
       } 
     }>(QUERIES.SlotDates, {
       slotDatesInput: {
         slotType,
-        branchId: branchId || this.defaultBranchId,
         customerOrderId: this.customerOrderId,
-        addressId,
+        ...this.slotLocation(slotType, branchId, addressId),
       },
     });
 
@@ -963,25 +1102,28 @@ export class WaitroseClient {
       throw new Error(`Get slots failed: ${result.data.slotDates.failures.map(f => f.message).join(", ")}`);
     }
 
-    return result.data.slotDates.content;
+    return result.data.slotDates.content ?? [];
   }
 
-  /** Get available slots for specific days */
-  async getSlotDays(slotType: SlotType, fromDate: string, branchId?: string, addressId?: string): Promise<SlotDay[]> {
+  /**
+   * Get the slot grid starting at `fromDate` (YYYY-MM-DD).
+   * @param days Number of days to return (API `size`; defaults to 1 server-side)
+   */
+  async getSlotDays(slotType: SlotType, fromDate: string, branchId?: string, addressId?: string, days?: number): Promise<SlotDay[]> {
     const result = await this.graphql<{ 
       data: { 
         slotDays: { 
-          content: SlotDay[];
+          content: SlotDay[] | null;
           failures: ApiFailure[] | null;
         } 
       } 
     }>(QUERIES.SlotDays, {
       slotDaysInput: {
         slotType,
-        branchId: branchId || this.defaultBranchId,
         customerOrderId: this.customerOrderId,
-        addressId,
+        ...this.slotLocation(slotType, branchId, addressId),
         fromDate,
+        ...(days !== undefined ? { size: days } : {}),
       },
     });
 
@@ -989,20 +1131,37 @@ export class WaitroseClient {
       throw new Error(`Get slot days failed: ${result.data.slotDays.failures.map(f => f.message).join(", ")}`);
     }
 
-    return result.data.slotDays.content;
+    return result.data.slotDays.content ?? [];
   }
 
-  /** Book a delivery/collection slot */
-  async bookSlot(slotId: string, slotType: SlotType, addressId?: string): Promise<BookSlotResult> {
+  /**
+   * Reserve a delivery/collection slot for the active trolley. The API has no
+   * slot-id argument: a slot is identified by type + start/end time + address
+   * (delivery) or branch (collection). The reservation is temporary until
+   * checkout and can be released with cancelSlot().
+   */
+  async bookSlot(params: BookSlotParams): Promise<BookSlotResult> {
+    const collection = isCollectionSlotType(params.slotType);
     const result = await this.graphql<{ 
       data: { 
         bookSlot: BookSlotResult & { failures: ApiFailure[] | null };
       } 
     }>(QUERIES.BookSlot, {
       input: {
-        slotId,
-        slotType,
-        addressId,
+        slotType: params.slotType,
+        customerOrderId: this.customerOrderId,
+        customerId: this.customerId ?? undefined,
+        startDateTime: params.startDateTime,
+        endDateTime: params.endDateTime,
+        ...(collection
+          ? { branchId: params.branchId || this.defaultBranchId || undefined }
+          : { addressId: params.addressId }),
+        postcode: params.postcode,
+        expectedSlotCharge: params.expectedSlotCharge
+          ? { amount: params.expectedSlotCharge.amount, currencyCode: params.expectedSlotCharge.currencyCode }
+          : undefined,
+        slotGridType: params.slotGridType ?? undefined,
+        greenSlot: params.greenSlot,
       },
     });
 
@@ -1011,6 +1170,105 @@ export class WaitroseClient {
     }
 
     return result.data.bookSlot;
+  }
+
+  /** Release a reserved slot (the website's "Cancel slot" action). */
+  async cancelSlot(slotReservationId: string): Promise<void> {
+    const result = await this.graphql<{ data: { cancelSlot: { failures: ApiFailure[] | null } | null } }>(
+      QUERIES.CancelSlot,
+      { slotReservationId }
+    );
+
+    const failures = result.data.cancelSlot?.failures;
+    if (failures?.length) {
+      throw new Error(`Cancel slot failed: ${failures.map(f => `${f.type}: ${f.message}`).join(", ")}`);
+    }
+  }
+
+  // ==========================================================================
+  // Branches (REST)
+  // ==========================================================================
+
+  /** Single GET against the branch finder — throws AuthError on 401 */
+  private async _findBranchesOnce(query: string): Promise<Branch[]> {
+    const response = await fetch(`${BRANCH_API_URL}?${query}`, {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "Waitrose/3.9.1 (Android)",
+        "Authorization": `Bearer ${this.accessToken ?? ANONYMOUS_BEARER}`,
+      },
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      upstreamCallsTotal.inc({ outcome: "error" });
+      if (response.status === 401) throw new AuthError(`HTTP 401: ${text}`);
+      throw new Error(`HTTP ${response.status}: ${text}`);
+    }
+
+    upstreamCallsTotal.inc({ outcome: "ok" });
+    const raw = await response.json() as {
+      branches?: Array<{
+        branch: {
+          id: number | string;
+          name: string;
+          type: string;
+          services?: string[];
+          contactDetails?: {
+            address1?: string; address2?: string; city?: string; county?: string; postcode?: string; phone?: string;
+          };
+        };
+        defaultBranch?: boolean;
+        distance?: number;
+        carParkCollectionEnabled?: boolean;
+      }>;
+    };
+
+    return (raw.branches ?? []).map(({ branch, defaultBranch, distance, carParkCollectionEnabled }) => ({
+      id: String(branch.id),
+      name: branch.name,
+      type: branch.type,
+      defaultBranch: !!defaultBranch,
+      ...(distance !== undefined ? { distance } : {}),
+      ...(carParkCollectionEnabled !== undefined ? { carParkCollectionEnabled } : {}),
+      services: branch.services ?? [],
+      address: {
+        address1: branch.contactDetails?.address1,
+        address2: branch.contactDetails?.address2,
+        city: branch.contactDetails?.city,
+        county: branch.contactDetails?.county,
+        postcode: branch.contactDetails?.postcode,
+      },
+      phone: branch.contactDetails?.phone,
+    }));
+  }
+
+  /**
+   * Find branches serving a postcode/town. For COLLECTION this lists nearby
+   * Click & Collect stores (pass one as branchId); for DELIVERY it returns the
+   * branch/fulfilment centre that delivers to that postcode.
+   */
+  async findBranches(
+    location: string,
+    fulfilmentType: FulfilmentType = "COLLECTION",
+    serviceType: "GROCERY" | "ENTERTAINING_PLACED_AT_HOME" = "GROCERY",
+  ): Promise<Branch[]> {
+    const params = new URLSearchParams({ fulfilment_type: fulfilmentType, location });
+    if (fulfilmentType === "COLLECTION") params.set("service_type", serviceType);
+    const query = params.toString();
+
+    await this.rateLimiter.acquire();
+    await this.ensureFreshToken();
+    try {
+      return await this._findBranchesOnce(query);
+    } catch (err) {
+      if (err instanceof AuthError && this._storedUsername && this._storedPassword) {
+        await this._handleReauth(new Date().toISOString());
+        return this._findBranchesOnce(query);
+      }
+      throw err;
+    }
   }
 
   // ==========================================================================
@@ -1160,6 +1418,7 @@ export class WaitroseClient {
       return [];
     }
     await this.rateLimiter.acquire();
+    await this.ensureFreshToken();
     try {
       return await this._fetchProductsByLineNumbersOnce(lineNumbers);
     } catch (err) {

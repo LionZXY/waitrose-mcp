@@ -5,8 +5,8 @@ const SAFE_ARGS: Record<string, Set<string>> = {
   get_products_by_line_numbers: new Set(["lineNumbers"]),
   get_promotion_products: new Set(["promotionId", "sortBy", "size", "start"]),
   get_trolley: new Set([]),
-  add_to_trolley: new Set(["lineNumber", "quantity", "uom"]),
-  remove_from_trolley: new Set(["lineNumber"]),
+  add_to_trolley: new Set(["lineNumber", "productId", "quantity", "uom"]),
+  remove_from_trolley: new Set(["lineNumber", "productId"]),
   update_trolley_items: new Set(["items"]),
   empty_trolley: new Set([]),
   get_pending_orders: new Set(["limit"]),
@@ -20,9 +20,14 @@ const SAFE_ARGS: Record<string, Set<string>> = {
   get_campaigns: new Set([]),
   // postcode is PII — intentionally omitted from get_current_slot allowlist
   get_current_slot: new Set([]),
+  list_delivery_addresses: new Set([]),
+  // postcode is PII — intentionally omitted from find_branches allowlist
+  find_branches: new Set(["fulfilmentType"]),
   list_slot_dates: new Set(["slotType", "branchId", "addressId"]),
-  list_slot_days: new Set(["slotType", "fromDate", "branchId", "addressId"]),
-  book_slot: new Set(["slotId", "slotType", "addressId", "confirm"]),
+  list_slot_days: new Set(["slotType", "fromDate", "days", "branchId", "addressId"]),
+  list_slots: new Set(["slotType", "fromDate", "days", "branchId", "addressId", "availableOnly"]),
+  book_slot: new Set(["slotId", "slotType", "addressId", "branchId", "replaceExisting", "confirm"]),
+  cancel_slot: new Set(["slotReservationId", "confirm"]),
 };
 
 /**
@@ -31,7 +36,7 @@ const SAFE_ARGS: Record<string, Set<string>> = {
  */
 const SAFE_ITEM_FIELDS: Record<string, Record<string, Set<string>>> = {
   update_trolley_items: {
-    items: new Set(["lineNumber", "quantity", "uom", "noteToShopper", "canSubstitute"]),
+    items: new Set(["lineNumber", "productId", "quantity", "uom", "noteToShopper", "canSubstitute"]),
   },
 };
 

@@ -1,7 +1,7 @@
 {
   "name": "waitrose-mcp",
   "version": "0.1.0",
-  "description": "MCP server exposing Waitrose product search",
+  "description": "MCP server for Waitrose product search, trolley, slots and orders",
   "license": "MIT",
   "type": "module",
   "main": "build/index.js",

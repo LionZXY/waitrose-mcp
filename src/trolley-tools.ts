@@ -20,23 +20,88 @@ import {
  * digging through the raw response body. The original response is spread
  * after this summary, so consumers that want full detail still have it.
  */
+export interface TrolleySummaryItem {
+  lineNumber: string;
+  productId: string | null;
+  name: string | null;
+  size: string | null;
+  quantity: { amount: number; uom: string };
+  /** Shelf price per unit as shown on the site, e.g. "40p" or "£2.10/kg" */
+  displayPrice: string | null;
+  unitPrice: Price | null;
+  totalPrice: Price | null;
+  canSubstitute: boolean;
+  noteToShopper: string | null;
+}
+
 export interface TrolleySummary {
   itemCount: number;
   totalEstimatedCost: Price;
   minimumSpendThresholdMet: boolean | null;
   failures: ApiFailure[];
+  /** Trolley lines joined with their product details (name, size, prices). */
+  items: TrolleySummaryItem[];
+  totals: {
+    itemTotalEstimatedCost: Price | null;
+    deliveryCharge: Price | null;
+    savingsFromOffers: Price | null;
+    savingsFromMyWaitrose: Price | null;
+  };
 }
 
 export type TrolleyToolResponse = TrolleyResponse & { summary: TrolleySummary };
 
+function summariseItems(r: TrolleyResponse): TrolleySummaryItem[] {
+  const products = new Map((r.products ?? []).map((p) => [p.lineNumber, p]));
+  return r.trolley.trolleyItems.map((item) => {
+    const p = products.get(item.lineNumber);
+    return {
+      lineNumber: item.lineNumber,
+      productId: p?.id ?? null,
+      name: p?.name ?? null,
+      size: p?.size ?? null,
+      quantity: { amount: item.quantity.amount, uom: item.quantity.uom },
+      displayPrice: p?.displayPrice ?? null,
+      unitPrice: p?.currentSaleUnitPrice?.price ?? null,
+      totalPrice: item.totalPrice ?? null,
+      canSubstitute: item.canSubstitute,
+      noteToShopper: item.noteToShopper ?? null,
+    };
+  });
+}
+
 function summarise(r: TrolleyResponse): TrolleyToolResponse {
+  const totals = r.trolley.trolleyTotals;
   const summary: TrolleySummary = {
     itemCount: r.trolley.trolleyItems.length,
-    totalEstimatedCost: r.trolley.trolleyTotals.totalEstimatedCost,
-    minimumSpendThresholdMet: r.trolley.trolleyTotals.minimumSpendThresholdMet ?? null,
+    totalEstimatedCost: totals.totalEstimatedCost,
+    minimumSpendThresholdMet: totals.minimumSpendThresholdMet ?? null,
     failures: r.failures ?? [],
+    items: summariseItems(r),
+    totals: {
+      itemTotalEstimatedCost: totals.itemTotalEstimatedCost ?? null,
+      deliveryCharge: totals.deliveryCharge ?? null,
+      savingsFromOffers: totals.savingsFromOffers ?? null,
+      savingsFromMyWaitrose: totals.savingsFromMyWaitrose ?? null,
+    },
   };
   return { ...r, summary };
+}
+
+/**
+ * Accept either a line number ("088411") or a full product id from search
+ * results ("088411-45361-45362"); the line number is the id's first segment.
+ */
+function parseLineNumber(args: Record<string, unknown>, prefix = ""): string {
+  const ln = args.lineNumber;
+  const pid = args.productId;
+  if (typeof ln === "string" && ln) return ln;
+  if (typeof pid === "string" && pid) {
+    const first = pid.split("-")[0];
+    if (/^\d+$/.test(first)) return first;
+    throw new McpError(ErrorCode.InvalidParams, `${prefix}productId is not a valid Waitrose product id`);
+  }
+  throw new McpError(ErrorCode.InvalidParams, `${prefix}lineNumber is required`);
 }
 
 const VALID_UOMS = new Set<UnitOfMeasure>(["C62", "KGM", "GRM"]);
@@ -85,12 +150,9 @@ function parseAddToTrolley(args: Record<string, unknown>): {
   quantity: number;
   uom: UnitOfMeasure;
 } {
-  const lineNumber = args.lineNumber;
+  const lineNumber = parseLineNumber(args);
   const quantity = (args.quantity as number | undefined) ?? 1;
   const uom = validateUom(args.uom, "add_to_trolley");
-  if (typeof lineNumber !== "string" || !lineNumber) {
-    throw new McpError(ErrorCode.InvalidParams, "lineNumber is required");
-  }
   if (typeof quantity !== "number" || quantity <= 0 || !Number.isFinite(quantity)) {
     throw new McpError(
       ErrorCode.InvalidParams,
@@ -116,15 +178,9 @@ function parseUpdateItems(args: Record<string, unknown>): TrolleyItemInput[] {
       );
     }
     const obj = raw as Record<string, unknown>;
-    const ln = obj.lineNumber;
+    const ln = parseLineNumber(obj, `items[${idx}].`);
     const qty = obj.quantity;
     const uom = validateUom(obj.uom, `items[${idx}]`);
-    if (typeof ln !== "string" || !ln) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        `items[${idx}].lineNumber is required`,
-      );
-    }
     if (typeof qty !== "number" || qty < 0 || !Number.isFinite(qty)) {
       throw new McpError(
         ErrorCode.InvalidParams,
@@ -170,11 +226,18 @@ export async function dispatchTrolleyTool(
     }
 
     case "remove_from_trolley": {
-      const lineNumber = args.lineNumber;
-      if (typeof lineNumber !== "string" || !lineNumber) {
-        throw new McpError(ErrorCode.InvalidParams, "lineNumber is required");
+      const lineNumber = parseLineNumber(args);
+      // Zero the line with its own unit of measure — weighed (KGM) lines
+      // aren't removed by a C62 quantity of 0.
+      const trolley = await client.getTrolley();
+      const line = trolley.trolley.trolleyItems.find((i) => i.lineNumber === lineNumber);
+      if (!line) {
+        throw new Error(`Line ${lineNumber} is not in the trolley`);
       }
-      return summarise(await client.removeFromTrolley(lineNumber));
+      const uom = VALID_UOMS.has(line.quantity.uom as UnitOfMeasure)
+        ? (line.quantity.uom as UnitOfMeasure)
+        : "C62";
+      return summarise(await client.removeFromTrolley(lineNumber, uom));
     }
 
     case "update_trolley_items": {

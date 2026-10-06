@@ -141,6 +141,72 @@ describe("dispatchTrolleyTool — get_trolley", () => {
   });
 });
 
+describe("dispatchTrolleyTool — summary.items", () => {
+  it("joins trolley lines with product details", async () => {
+    const client = makeClient();
+    const trolley = makeTrolley(2, 1.1);
+    trolley.trolley.trolleyItems[0].lineNumber = "088461";
+    trolley.trolley.trolleyItems[0].quantity = { amount: 2, uom: "C62" };
+    trolley.trolley.trolleyItems[0].totalPrice = { amount: 0.7, currencyCode: "GBP" };
+    trolley.products = [
+      {
+        id: "088461-45403-45404",
+        lineNumber: "088461",
+        name: "Waitrose Loose Limes",
+        brandName: "WAITROSE",
+        displayPrice: "35p",
+        size: "each",
+        thumbnail: "",
+        productType: "G",
+        currentSaleUnitPrice: { price: { amount: 0.35, currencyCode: "GBP" }, quantity: { amount: 1, uom: "C62" } },
+      },
+    ];
+    client.getTrolley.mockResolvedValueOnce(trolley);
+    const data = await dispatchTrolleyTool(asClient(client), "get_trolley", {});
+    expect(data.summary.items).toHaveLength(2);
+    expect(data.summary.items[0]).toEqual({
+      lineNumber: "088461",
+      productId: "088461-45403-45404",
+      name: "Waitrose Loose Limes",
+      size: "each",
+      quantity: { amount: 2, uom: "C62" },
+      displayPrice: "35p",
+      unitPrice: { amount: 0.35, currencyCode: "GBP" },
+      totalPrice: { amount: 0.7, currencyCode: "GBP" },
+      canSubstitute: true,
+      noteToShopper: null,
+    });
+    // A line with no matching product still appears, with null product fields
+    expect(data.summary.items[1]).toMatchObject({ lineNumber: "ln1", name: null, productId: null });
+    expect(data.summary.totals.itemTotalEstimatedCost?.amount).toBe(1.1);
+  });
+});
+
+describe("dispatchTrolleyTool — productId input", () => {
+  it("add_to_trolley derives the line number from a product id", async () => {
+    const client = makeClient();
+    await dispatchTrolleyTool(asClient(client), "add_to_trolley", { productId: "088411-45361-45362", quantity: 2 });
+    expect(client.addToTrolley).toHaveBeenCalledWith("088411", 2, "C62");
+  });
+
+  it("update_trolley_items accepts productId per item", async () => {
+    const client = makeClient();
+    await dispatchTrolleyTool(asClient(client), "update_trolley_items", {
+      items: [{ productId: "088411-45361-45362", quantity: 0 }],
+    });
+    expect(client.updateTrolleyItems).toHaveBeenCalledWith([
+      { lineNumber: "088411", quantity: { amount: 0, uom: "C62" } },
+    ]);
+  });
+
+  it("rejects a malformed productId", async () => {
+    const client = makeClient();
+    await expect(
+      dispatchTrolleyTool(asClient(client), "add_to_trolley", { productId: "abc-def" }),
+    ).rejects.toBeInstanceOf(McpError);
+  });
+});
+
 describe("dispatchTrolleyTool — write tools also surface summary", () => {
   it("add_to_trolley response carries summary", async () => {
     const client = makeClient();
@@ -274,12 +340,39 @@ describe("dispatchTrolleyTool — add_to_trolley", () => {
 });
 
 describe("dispatchTrolleyTool — remove_from_trolley", () => {
-  it("calls client.removeFromTrolley", async () => {
+  it("calls client.removeFromTrolley with the line's unit of measure", async () => {
     const client = makeClient();
+    client.getTrolley.mockResolvedValueOnce(makeTrolley(2, 2));
     await dispatchTrolleyTool(asClient(client), "remove_from_trolley", {
       lineNumber: "ln1",
     });
-    expect(client.removeFromTrolley).toHaveBeenCalledWith("ln1");
+    expect(client.removeFromTrolley).toHaveBeenCalledWith("ln1", "C62");
+  });
+
+  it("zeroes weighed lines with KGM", async () => {
+    const client = makeClient();
+    const trolley = makeTrolley(1, 2);
+    trolley.trolley.trolleyItems[0].quantity = { amount: 0.5, uom: "KGM" };
+    client.getTrolley.mockResolvedValueOnce(trolley);
+    await dispatchTrolleyTool(asClient(client), "remove_from_trolley", { lineNumber: "ln0" });
+    expect(client.removeFromTrolley).toHaveBeenCalledWith("ln0", "KGM");
+  });
+
+  it("accepts a productId instead of lineNumber", async () => {
+    const client = makeClient();
+    const trolley = makeTrolley(1, 1);
+    trolley.trolley.trolleyItems[0].lineNumber = "088411";
+    client.getTrolley.mockResolvedValueOnce(trolley);
+    await dispatchTrolleyTool(asClient(client), "remove_from_trolley", { productId: "088411-45361-45362" });
+    expect(client.removeFromTrolley).toHaveBeenCalledWith("088411", "C62");
+  });
+
+  it("errors when the line is not in the trolley", async () => {
+    const client = makeClient();
+    await expect(
+      dispatchTrolleyTool(asClient(client), "remove_from_trolley", { lineNumber: "nope" }),
+    ).rejects.toThrow(/not in the trolley/);
+    expect(client.removeFromTrolley).not.toHaveBeenCalled();
   });
 
   it("rejects missing lineNumber", async () => {
